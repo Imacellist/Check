@@ -55,6 +55,7 @@
       "^https:\\/\\/[^/]*\\.dynamics\\.com(/.*)?$",
       "^https:\\/\\/(?:[^/]*\\.)?zoom\\.us(/.*)?$",
       "^https:\\/\\/github\\.com(/.*)?$",
+      "^https:\\/\\/msn\\.com(/.*)?$",
       "^https:\\/\\/[^/]*\\.github\\.com(/.*)?$",
       "^https:\\/\\/[^/]*\\.github\\.io(/.*)?$"
     ],
