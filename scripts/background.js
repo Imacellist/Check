@@ -11,6 +11,7 @@ import { ConfigManager } from "./modules/config-manager.js";
 import { PolicyManager } from "./modules/policy-manager.js";
 import { DetectionRulesManager } from "./modules/detection-rules-manager.js";
 import { WebhookManager } from "./modules/webhook-manager.js";
+import { DomainSquattingDetector } from "./modules/domain-squatting-detector.js";
 import logger from "./utils/logger.js";
 import { store as storeLog } from "./utils/background-logger.js";
 
@@ -288,8 +289,12 @@ class CheckBackground {
   constructor() {
     this.configManager = new ConfigManager();
     this.policyManager = new PolicyManager();
-    this.detectionRulesManager = new DetectionRulesManager();
+    this.detectionRulesManager = new DetectionRulesManager(
+      this.configManager,
+      (rules) => this._handleDetectionRulesUpdated(rules)
+    );
     this.rogueAppsManager = new RogueAppsManager();
+    this.domainSquattingDetector = new DomainSquattingDetector();
     this.webhookManager = new WebhookManager(this.configManager);
     this.isInitialized = false;
     this.initializationPromise = null;
@@ -398,6 +403,17 @@ class CheckBackground {
 
       // Initialize detection rules manager
       await this.detectionRulesManager.initialize();
+      
+      // Initialize domain squatting detector with rules and URL allowlist
+      const detectionRules = this.detectionRulesManager.cachedRules;
+      if (detectionRules) {
+        const runtimeConfig = await this.configManager.getConfig();
+        await this.domainSquattingDetector.initialize(
+          detectionRules,
+          runtimeConfig
+        );
+        logger.log("Domain squatting detector initialized");
+      }
 
       await this.refreshPolicy();
 
@@ -850,6 +866,28 @@ class CheckBackground {
     } else if (details.reason === "update") {
       // Handle extension updates
       await safe(this.configManager.migrateConfig(details.previousVersion));
+    }
+  }
+
+  /**
+   * Invoked by DetectionRulesManager whenever a remote rules fetch succeeds
+   * (forced, on-save, or via the lazy background refresh triggered by page
+   * detection). Re-initializes downstream subsystems with the new rules so
+   * they don't lag behind the cache.
+   */
+  async _handleDetectionRulesUpdated(rules) {
+    try {
+      if (!rules || !this.domainSquattingDetector) return;
+      const runtimeConfig = await this.configManager.getConfig();
+      await this.domainSquattingDetector.initialize(rules, runtimeConfig);
+      logger.log(
+        "Domain squatting detector re-initialized after rules refresh"
+      );
+    } catch (error) {
+      logger.warn(
+        "Failed to re-init domain squatting detector after rules refresh:",
+        error?.message || error
+      );
     }
   }
 
@@ -1411,11 +1449,58 @@ class CheckBackground {
               rules,
               message: "Detection rules updated",
             });
+            
+            // Also update domain squatting detector with new rules and URL allowlist
+            const updatedRules = await this.detectionRulesManager.getDetectionRules();
+            if (updatedRules && this.domainSquattingDetector) {
+              const runtimeConfig = await this.configManager.getConfig();
+              await this.domainSquattingDetector.initialize(
+                updatedRules,
+                runtimeConfig
+              );
+              logger.log("Domain squatting detector updated with new rules");
+            }
           } catch (error) {
             logger.error(
               "Check: Failed to force update detection rules:",
               error
             );
+            sendResponse({ success: false, error: error.message });
+          }
+          break;
+        
+        case "check_domain_squatting":
+          try {
+            const { domain } = message;
+            if (!domain) {
+              sendResponse({ success: false, error: "Domain parameter required" });
+              break;
+            }
+            
+            const result = this.domainSquattingDetector.checkDomain(domain);
+            sendResponse({ success: true, result });
+          } catch (error) {
+            logger.error("Check: Failed to check domain squatting:", error);
+            sendResponse({ success: false, error: error.message });
+          }
+          break;
+
+        case "REDIRECT_TO_BLOCKED_PAGE":
+          try {
+            if (!sender.tab?.id) {
+              sendResponse({ success: false, error: "No tab ID available" });
+              break;
+            }
+
+            if (!message.url) {
+              sendResponse({ success: false, error: "No redirect URL provided" });
+              break;
+            }
+
+            await chrome.tabs.update(sender.tab.id, { url: message.url });
+            sendResponse({ success: true });
+          } catch (error) {
+            logger.error("Check: Failed to redirect tab to blocked page:", error);
             sendResponse({ success: false, error: error.message });
           }
           break;
@@ -1427,6 +1512,10 @@ class CheckBackground {
             const previousBadgeEnabled =
               currentConfig?.enableValidPageBadge ||
               this.policy?.EnableValidPageBadge;
+            const previousRulesUrl =
+              currentConfig?.customRulesUrl ||
+              currentConfig?.detectionRules?.customRulesUrl ||
+              null;
 
             // Update the configuration
             await this.configManager.updateConfig(message.config);
@@ -1439,6 +1528,42 @@ class CheckBackground {
             const newBadgeEnabled =
               updatedConfig?.enableValidPageBadge ||
               this.policy?.EnableValidPageBadge;
+
+            // On config save, always pull fresh rules so a URL change (or any
+            // other policy save) immediately reflects new rules in cache and
+            // in the domain-squatting detector. The onRulesUpdated callback
+            // wired into DetectionRulesManager will reinit the squatting
+            // detector once the fetch completes, so we don't need to do that
+            // here for the success path - but we still re-init synchronously
+            // below to cover the case where the network fetch fails.
+            const newRulesUrl =
+              updatedConfig?.customRulesUrl ||
+              updatedConfig?.detectionRules?.customRulesUrl ||
+              null;
+            this.detectionRulesManager.updateDetectionRules().catch((err) => {
+              logger.warn(
+                "Pull-on-save detection-rules update failed:",
+                err?.message || err
+              );
+            });
+            if (previousRulesUrl !== newRulesUrl) {
+              logger.log(
+                `customRulesUrl changed (${previousRulesUrl || "<default>"} -> ${
+                  newRulesUrl || "<default>"
+                }) - background rules pull triggered`
+              );
+            }
+
+            // Update domain squatting detector with new configuration
+            // If URL allowlist changed, reinitialize detector to extract new domains
+            if (this.domainSquattingDetector) {
+              const detectionRules = this.detectionRulesManager.cachedRules || {};
+              await this.domainSquattingDetector.initialize(
+                detectionRules,
+                updatedConfig
+              );
+              logger.log("Domain squatting detector configuration updated");
+            }
 
             // If badge was disabled, remove badges from all tabs
             if (previousBadgeEnabled && !newBadgeEnabled) {
@@ -1798,8 +1923,9 @@ class CheckBackground {
         enhancedEvent.threatDetected = true;
         break;
       case "threat_detected":
-        enhancedEvent.action = event.action || "blocked";
-        enhancedEvent.threatLevel = event.threatLevel || "high";
+        enhancedEvent.action = event.action || "warned";
+        enhancedEvent.threatLevel =
+          event.threatLevel || event.severity || "medium";
         enhancedEvent.threatDetected = true;
         break;
       case "form_submission":
