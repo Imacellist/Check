@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: '20'
       - name: Merge upstream rules with custom domains
-        run: node scripts/merge-rules.js
+        run: node scripts/merge-rules.cjs
       - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
